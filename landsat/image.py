@@ -4,15 +4,18 @@
 
 import warnings
 import sys
-from os.path import join
+from os.path import join, isdir
 import tarfile
+import glob
+import subprocess
+
 import numpy
 import rasterio
-import glob
 from rasterio.warp import reproject, RESAMPLING, transform
 
-from skimage import img_as_ubyte, exposure
 from skimage import transform as sktransform
+from skimage.util import img_as_ubyte
+from skimage.exposure import rescale_intensity
 
 import settings
 from mixins import VerbosityMixin
@@ -20,24 +23,40 @@ from utils import get_file, timer, check_create_folder, exit
 
 
 class FileDoesNotExist(Exception):
+    """ Exception to be used when the file does not exist. """
     pass
 
 
 class Process(VerbosityMixin):
     """
     Image procssing class
+
+    To initiate the following parameters must be passed:
+
+    :param path:
+        Path of the image.
+    :type path:
+        String
+    :param bands:
+        The band sequence for the final image. Must be a python list. (optional)
+    :type bands:
+        List
+    :param dst_path:
+        Path to the folder where the image should be stored. (optional)
+    :type dst_path:
+        String
+    :param verbose:
+        Whether the output should be verbose. Default is False.
+    :type verbose:
+        boolean
+    :param force_unzip:
+        Whether to force unzip the tar file. Default is False
+    :type force_unzip:
+        boolean
+
     """
 
-    def __init__(self, path, bands=None, dst_path=None, verbose=False):
-        """
-        @params
-        scene - the scene ID
-        bands - The band sequence for the final image. Must be a python list
-        src_path - The path to the source image bundle
-        dst_path - The destination path
-        zipped - Set to true if the scene is in zip format and requires unzipping
-        verbose - Whether to sh ow verbose output
-        """
+    def __init__(self, path, bands=None, dst_path=None, verbose=False, force_unzip=False):
 
         self.projection = {'init': 'epsg:3857'}
         self.dst_crs = {'init': u'epsg:3857'}
@@ -56,15 +75,37 @@ class Process(VerbosityMixin):
         self.scene_path = join(self.src_path, self.scene)
 
         if self._check_if_zipped(path):
-            self._unzip(join(self.src_path, get_file(path)), join(self.src_path, self.scene), self.scene)
+            self._unzip(join(self.src_path, get_file(path)), join(self.src_path, self.scene), self.scene, force_unzip)
 
         self.bands_path = []
         for band in self.bands:
             self.bands_path.append(join(self.scene_path, self._get_full_filename(band)))
 
     def run(self, pansharpen=True):
+        """ Executes the image processing.
+
+        :param pansharpen:
+            Whether the process should also run pansharpenning. Default is True
+        :type pansharpen:
+            boolean
+
+        :returns:
+            (String) the path to the processed image
+        """
 
         self.output("* Image processing started for bands %s" % "-".join(map(str, self.bands)), normal=True)
+
+        # Read cloud coverage from mtl file
+        cloud_cover = 0
+        try:
+            with open(self.scene_path + '/' + self.scene + '_MTL.txt', 'rU') as mtl:
+                lines = mtl.readlines()
+                for line in lines:
+                    if 'CLOUD_COVER' in line:
+                        cloud_cover = float(line.replace('CLOUD_COVER = ', ''))
+                        break
+        except IOError:
+            pass
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -103,10 +144,17 @@ class Process(VerbosityMixin):
                 crn = self._get_boundaries(src_data)
 
                 dst_shape = src_data['shape']
-                y_pixel = (max(crn['ul']['y'][1][0],crn['ur']['y'][1][0])- min(crn['lr']['y'][1][0],crn['ll']['y'][1][0]))/dst_shape[0]
-                x_pixel = (max(crn['lr']['x'][1][0],crn['ur']['x'][1][0]) - min(crn['ul']['x'][1][0],crn['ll']['x'][1][0]))/dst_shape[1]
+                dst_corner_ys = [crn[k]['y'][1][0] for k in crn.keys()]
+                dst_corner_xs = [crn[k]['x'][1][0] for k in crn.keys()]
+                y_pixel = abs(max(dst_corner_ys) - min(dst_corner_ys)) / dst_shape[0]
+                x_pixel = abs(max(dst_corner_xs) - min(dst_corner_xs)) / dst_shape[1]
 
-                dst_transform = (min(crn['ul']['x'][1][0],crn['ll']['x'][1][0]), x_pixel, 0.0, max(crn['ul']['y'][1][0],crn['ur']['y'][1][0]), 0.0, -y_pixel)
+                dst_transform = (min(dst_corner_xs),
+                                 x_pixel,
+                                 0.0,
+                                 max(dst_corner_ys),
+                                 0.0,
+                                 -y_pixel)
                 # Delete crn since no longer needed
                 del crn
 
@@ -149,16 +197,8 @@ class Process(VerbosityMixin):
 
                 for i, band in enumerate(new_bands):
                     # Color Correction
-                    band = self._color_correction(band, self.bands[i])
+                    band = self._color_correction(band, self.bands[i], 0, cloud_cover)
 
-                    # Gamma Correction
-                    if i == 0:
-                        band = self._gamma_correction(band, 1.1)
-
-                    if i == 2:
-                        band = self._gamma_correction(band, 0.9)
-
-                    
                     output.write_band(i+1, img_as_ubyte(band))
 
                     new_bands[i] = None
@@ -186,17 +226,17 @@ class Process(VerbosityMixin):
 
         return bands
 
-    def _gamma_correction(self, band, value):
-        return exposure.adjust_gamma(band, value)
-
-    def _color_correction(self, band, band_id):
+    def _color_correction(self, band, band_id, low, cloud_cover):
         band = band.astype(numpy.uint16)
 
         self.output("Color correcting band %s" % band_id, normal=True, color='green', indent=1)
-        p2, p98 = self._percent_cut(band)
-        band = exposure.rescale_intensity(band, in_range=(p2, p98))
-
-        return band
+        p_low, cloud_cut_low = self._percent_cut(band, low, 100 - (cloud_cover * 3 / 4))
+        temp = numpy.zeros(numpy.shape(band), dtype=numpy.uint16)
+        cloud_divide = 65000 - cloud_cover * 100
+        mask = numpy.logical_and(band < cloud_cut_low, band > 0)
+        temp[mask] = rescale_intensity(band[mask], in_range=(p_low, cloud_cut_low), out_range=(256, cloud_divide))
+        temp[band >= cloud_cut_low] = rescale_intensity(band[band >= cloud_cut_low], out_range=(cloud_divide, 65535))
+        return temp
 
     def _read_band(self, band_path):
         """ Reads a band with rasterio """
@@ -248,15 +288,25 @@ class Process(VerbosityMixin):
 
         return output
 
-    def _percent_cut(self, color):
-        return numpy.percentile(color[numpy.logical_and(color > 0, color < 65535)], (2, 98))
+    def _percent_cut(self, color, low, high):
+        return numpy.percentile(color[numpy.logical_and(color > 0, color < 65535)], (low, high))
 
-    def _unzip(self, src, dst, scene):
+    def _unzip(self, src, dst, scene, force_unzip=False):
         """ Unzip tar files """
         self.output("Unzipping %s - It might take some time" % scene, normal=True, arrow=True)
-        tar = tarfile.open(src)
-        tar.extractall(path=dst)
-        tar.close()
+
+        try:
+            # check if file is already unzipped, skip
+            if isdir(dst) and not force_unzip:
+                self.output("%s is already unzipped." % scene, normal=True, arrow=True)
+                return
+            else:
+                tar = tarfile.open(src, 'r')
+                tar.extractall(path=dst)
+                tar.close()
+        except tarfile.ReadError:
+            check_create_folder(dst)
+            subprocess.check_call(['tar', '-xf', src, '-C', dst])
 
     def _get_full_filename(self, band):
 
